@@ -2,7 +2,9 @@ from PySide2 import QtWidgets, QtGui, QtCore
 import json
 import maya.cmds as cmds
 import maya.OpenMayaUI as omui
+import maya.api.OpenMaya as om
 from shiboken2 import wrapInstance
+from functools import wraps
 
 def get_maya_main_window():
     main_window_ptr = omui.MQtUtil.mainWindow()
@@ -10,6 +12,16 @@ def get_maya_main_window():
         return wrapInstance(int(main_window_ptr), QtWidgets.QWidget)
     else:
         return None
+
+def undoable(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        cmds.undoInfo(openChunk=True)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            cmds.undoInfo(closeChunk=True)
+    return wrapper
 
 def hex_value(hex_color, factor):
     color = QtGui.QColor(hex_color)
@@ -90,7 +102,8 @@ def create_pole_ref(ik2_object, fk2_control_joint_object):
             print("IK pole Ref Created")
     else:
         cmds.confirmDialog(title='IK pole Ref', message='Input IK pole control and FK2 Joint.       ', button=['OK'])
-       
+
+@undoable      
 def match_fk_to_ik(fk_controls, ik_joints):
     '''
     Matches the FK controls to the corresponding IK joints.
@@ -99,29 +112,48 @@ def match_fk_to_ik(fk_controls, ik_joints):
         cmds.matchTransform(fk_ctrl, ik_jnt, pos=False, rot=True)
     print("FK controls matched to IK joints.")
 
+def calculate_pole_vector(start_joint, mid_joint, end_joint, pole_vector_ctrl, pole_distance=1.0):
+    # Get world space positions of the joints
+    start_pos = cmds.xform(start_joint, query=True, worldSpace=True, translation=True)
+    mid_pos = cmds.xform(mid_joint, query=True, worldSpace=True, translation=True)
+    end_pos = cmds.xform(end_joint, query=True, worldSpace=True, translation=True)
+
+    # Convert to MVector for easier calculations
+    start_vec = om.MVector(start_pos)
+    mid_vec = om.MVector(mid_pos)
+    end_vec = om.MVector(end_pos)
+
+    # Calculate the pole vector position
+    start_to_end = end_vec - start_vec
+    start_to_mid = mid_vec - start_vec
+
+    # Calculate the projection manually
+    start_to_end_normalized = start_to_end.normal()
+    projection_length = start_to_mid * start_to_end_normalized
+    projection = start_to_end_normalized * projection_length
+
+    # Calculate the pole vector direction
+    pole_vec = (mid_vec - (start_vec + projection)).normal()
+
+    # Calculate the final pole vector position
+    chain_length = (mid_vec - start_vec).length() + (end_vec - mid_vec).length()
+    pole_pos = mid_vec + (pole_vec * chain_length * pole_distance)
+
+    # Set the pole vector control position
+    cmds.xform(pole_vector_ctrl, worldSpace=True, translation=pole_pos)
+
+@undoable
 def match_ik_to_fk(ik_controls, fk_joints, ik_pole, ik_pole_locator):
     '''
     Matches the IK controls to the corresponding FK joints and uses a locator for the pole vector.
     '''
-    # Create a locator and rename it
-    #ik_pole_locator = cmds.spaceLocator(name=ik_pole_locator_name)[0]
-    
-    # Match the locator to ik2_pole
-    #cmds.matchTransform(ik_pole_locator, ik_pole, pos=True, rot=True)
-    
-    # Parent the locator to ik2_jnt
-    #cmds.parent(ik_pole_locator, ik_controls[1])  # Assuming ik_controls[1] is ik2_jnt
-    
     # Match ik3_ctrl to fk3_jnt
     cmds.matchTransform(ik_controls[2], fk_joints[2], pos=True, rot=True)
     
     # Match ik2_pole to the locator
-    cmds.matchTransform(ik_pole, ik_pole_locator, pos=True, rot=True)
+    calculate_pole_vector(fk_joints[0],fk_joints[1],fk_joints[2], ik_pole, pole_distance=0.5)
+    #cmds.matchTransform(ik_pole, ik_pole_locator, pos=True, rot=True)
     
-    # Delete the locator
-    #cmds.delete(ik_pole_locator)
-    #print("IK controls matched to FK joints and pole vector aligned.")
-
 class CustomDelegate(QtWidgets.QStyledItemDelegate):
     def __init__(self, parent=None):
         super(CustomDelegate, self).__init__(parent)
@@ -133,12 +165,13 @@ class CustomDelegate(QtWidgets.QStyledItemDelegate):
         return size
     
 class PinnedObjectButton(QtWidgets.QFrame):
-    def __init__(self, parent=None, selColor="#487593"):
+    def __init__(self, parent=None, selColor="#487593", onlyText = False):
         super(PinnedObjectButton, self).__init__(parent)
         self.pinned = False
         self.object_name = None
         self.deSelColor = "#333333"
         self.selColor = selColor
+        self.onlyText = onlyText
         self.setFrameShape(QtWidgets.QFrame.StyledPanel)
         self.setFrameShadow(QtWidgets.QFrame.Raised)
         self.setStyleSheet(f'''QFrame{{background-color: {self.deSelColor};border-radius: 4px; border: 0px solid #444444;}}''')
@@ -156,6 +189,8 @@ class PinnedObjectButton(QtWidgets.QFrame):
         self.name_label.setStyleSheet("QLabel{background-color: transparent; color:white; border: 0px;}")
         self.name_label.setAlignment(QtCore.Qt.AlignCenter)
         
+        
+
         self.pin_button = QtWidgets.QPushButton(self)
         self.pin_button.setStyleSheet(f'''QPushButton{{background-color: transparent;border-radius: 4px; border: 0px solid #444444;}} QPushButton:hover {{background-color: {self.selColor} ;}}''')
         self.pin_button.setCheckable(True)
@@ -170,7 +205,8 @@ class PinnedObjectButton(QtWidgets.QFrame):
                                      QToolTip {{background-color: #222222; color: white; border:0px;}} ''')
         
         self.combo_box.setToolTip(f" Select Joint")
-        self.combo_box.setMaximumWidth(140)
+        #self.combo_box.setMaximumWidth(140)
+        self.combo_box.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.combo_box.setVisible(False)
         delegate = CustomDelegate(self.combo_box)
         self.combo_box.setItemDelegate(delegate)
@@ -181,12 +217,14 @@ class PinnedObjectButton(QtWidgets.QFrame):
                                      QToolTip {{background-color: #222222; color: white; border:0px;}} ''')
         
         self.line_edit.setToolTip(f" Type Joint name")
-        self.line_edit.setMaximumWidth(140)
+        #if self.onlyText == False:
+            #self.line_edit.setMaximumWidth(140)
         self.line_edit.setVisible(True)
         self.line_edit.textChanged.connect(self.validate_joint_name)
 
         self.layout.addWidget(self.icon_label)
         self.layout.addWidget(self.name_label)
+        self.layout.addSpacing(5 if self.onlyText else 10)
         self.layout.addWidget(self.combo_box)
         self.layout.addWidget(self.line_edit)
         self.layout.addSpacing(5)
@@ -196,6 +234,15 @@ class PinnedObjectButton(QtWidgets.QFrame):
         self.customContextMenuRequested.connect(self.show_context_menu)
         
         self.update_button()
+        self.update_onlyText()
+
+    def update_onlyText(self):
+        if self.onlyText == True:
+            icon = QtGui.QIcon(':kinJoint.png')
+            pixmap = icon.pixmap(20, 20)  # Set the size to match the label's fixed size
+            self.icon_label.setPixmap(pixmap)
+            self.name_label.setVisible(False)
+            #self.line_edit.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
     def validate_joint_name(self):
         # Get the text from the QLineEdit
@@ -243,6 +290,7 @@ class PinnedObjectButton(QtWidgets.QFrame):
         
         #self.update_combo_box()
         self.update_selection()
+        
 
     def update_selection(self):
         selected_objects = cmds.ls(selection=True, shortNames=True)
@@ -270,6 +318,7 @@ class PinnedObjectButton(QtWidgets.QFrame):
             self.combo_box.setVisible(False)
             self.line_edit.setVisible(True)
         self.update_combo_box_color()
+        self.update_onlyText()
 
     def update_combo_box(self):
         selected_objects = cmds.ls(selection=True, shortNames=True)
@@ -439,9 +488,9 @@ class PinnedObjectWindow(QtWidgets.QDialog):
         self.fk3_button.setToolTip(f"FK3: Wrist or Ankle FK Control | Wrist or Ankle FK Joint")
         grid_layout.addWidget(self.fk3_button, 2, 1)
 
-        self.ik1_button = PinnedObjectButton(self,selColor="#7452A7")
+        self.ik1_button = PinnedObjectButton(self,selColor="#7452A7",onlyText=True)
         grid_layout.addWidget(self.create_label("IK 1 :"), 3, 0, QtCore.Qt.AlignRight)
-        self.ik1_button.setToolTip(f"IK 1: <Pole Reference> | <Shoulder or hip IK joint>")
+        self.ik1_button.setToolTip(f"IK 1: <Shoulder or hip IK joint>")
         grid_layout.addWidget(self.ik1_button, 3, 1)
 
         self.ik2_button = PinnedObjectButton(self,selColor="#7452A7")
@@ -477,21 +526,21 @@ class PinnedObjectWindow(QtWidgets.QDialog):
         ik_to_fk_button.clicked.connect(self.execute_ik_to_fk)
         execute_frame.layout.addWidget(ik_to_fk_button)
         
-        # Add the new "Create Pole Ref" button
+        '''# Add the new "Create Pole Ref" button
         self.create_pole_ref_button = QtWidgets.QPushButton("Create Pole Ref")
         self.button_style(self.create_pole_ref_button, "#333333", "<b>Create Pole Reference:</b> <br> This locator should be pinned to IK1")
         self.create_pole_ref_button.setFixedWidth(95)
         self.create_pole_ref_button.setVisible(True)
         self.create_pole_ref_button.clicked.connect(self.execute_create_pole_ref)
 
-        execute_frame.layout.addWidget(self.create_pole_ref_button)
+        execute_frame.layout.addWidget(self.create_pole_ref_button)'''
         
         main_layout.addWidget(execute_frame)
         self.setLayout(main_layout)
     
-    def execute_create_pole_ref(self):
+    '''def execute_create_pole_ref(self):
         pinned_objects = self.get_current_pinned_objects()
-        create_pole_ref(pinned_objects['IK2']['object_name'], pinned_objects['FK2']['control_joint_obj'])
+        create_pole_ref(pinned_objects['IK2']['object_name'], pinned_objects['FK2']['control_joint_obj'])'''
 
     def execute_fk_to_ik(self):
         pinned_objects = self.get_current_pinned_objects()
